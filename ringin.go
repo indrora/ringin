@@ -23,46 +23,30 @@ type Config struct {
 		Parity   string `toml:"parity"`
 		StopBits int    `toml:"stop_bits"`
 	} `toml:"serial"`
+
 	Modem struct {
 		InitCommands []string `toml:"init_commands"`
 	} `toml:"modem"`
+
 	Program struct {
 		Command string   `toml:"command"`
 		Args    []string `toml:"args"`
 	} `toml:"program"`
+
+	mode *serial.Mode // Non-exported field for parsed mode
 }
 
 func loadConfig(path string) (*Config, error) {
 	var config Config
 	_, err := toml.DecodeFile(path, &config)
-	return &config, err
-}
-
-func main() {
-	writeDefaults := flag.Bool("write-defaults", false, "Write default configuration to specified config file")
-	configPath := flag.String("config", "ringin.toml", "Path to configuration file")
-	flag.Parse()
-
-	if *writeDefaults {
-		if err := writeDefaultConfig(*configPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to write default config: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Default configuration written to %s\n", *configPath)
-		os.Exit(0)
-	}
-	config, err := loadConfig(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
+		return nil, err
 	}
 
-	mode := &serial.Mode{
-		BaudRate: config.Serial.BaudRate,
-		DataBits: config.Serial.DataBits,
-	}
+	// Parse parity
+	var mode serial.Mode
+	config.mode = &mode
 
-	// Set parity based on config
 	switch strings.ToUpper(config.Serial.Parity) {
 	case "N":
 		mode.Parity = serial.NoParity
@@ -70,107 +54,120 @@ func main() {
 		mode.Parity = serial.EvenParity
 	case "O":
 		mode.Parity = serial.OddParity
+	default:
+		return nil, fmt.Errorf("invalid parity setting")
 	}
 
-	// Set stop bits based on config
+	// Parse stop bits
 	switch config.Serial.StopBits {
 	case 1:
 		mode.StopBits = serial.OneStopBit
 	case 2:
 		mode.StopBits = serial.TwoStopBits
+	default:
+		return nil, fmt.Errorf("invalid stop bits setting")
+	}
+	// Set other mode fields
+	config.mode.BaudRate = config.Serial.BaudRate
+	config.mode.DataBits = config.Serial.DataBits
+
+	return &config, nil
+}
+
+func main() {
+	writeDefaults := flag.Bool("write-defaults", false, "Write default configuration")
+	configPath := flag.String("config", "ringin.toml", "Configuration file path")
+	flag.Parse()
+
+	if *writeDefaults {
+		err := writeDefaultConfig(*configPath)
+		if err != nil {
+			fmt.Println("Error writing default config:", err)
+			return
+		}
 	}
 
-	port, err := serial.Open(config.Serial.Port, mode)
+	config, err := loadConfig(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to open serial port: %v\n", err)
-		os.Exit(1)
+		fmt.Println("Error loading config:", err)
+		return
+	}
+
+	if err := runModemLoop(config); err != nil {
+		fmt.Println("Error in modem loop:", err)
+	}
+}
+
+func handleRing(port *serial.Port, reader *bufio.Reader, command string, args []string) {
+	cmd := exec.Command(command, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		fmt.Println("Error creating stdin pipe:", err)
+		return
+	}
+
+	go func() {
+		io.Copy(stdin, reader)
+		stdin.Close()
+	}()
+
+	cmd.Stdout = *port
+	cmd.Stdin = *port
+	cmd.Stderr = os.Stderr
+
+	done := make(chan bool)
+	go func() {
+		cmd.Wait()
+		done <- true
+	}()
+
+	go func() {
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if strings.Contains(strings.TrimSpace(line), "NO CARRIER") {
+				cmd.Process.Kill()
+				done <- true
+				return
+			}
+		}
+	}()
+
+	<-done
+}
+
+func runModemLoop(config *Config) error {
+	port, err := serial.Open(config.Serial.Port, config.mode)
+	if err != nil {
+		return fmt.Errorf("error opening port: %w", err)
 	}
 	defer port.Close()
-
-	// Initialize modem using commands from config
-	for _, cmd := range config.Modem.InitCommands {
-		_, err := port.Write([]byte(cmd + "\r"))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to send command %s: %v\n", cmd, err)
-			os.Exit(1)
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
 
 	reader := bufio.NewReader(port)
 
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading from port: %v\n", err)
-			continue
+			return fmt.Errorf("error reading from port: %w", err)
 		}
 
-		line = strings.TrimSpace(line)
-
-		switch {
-		case strings.Contains(line, "RING"):
-			fmt.Println("Incoming call detected")
-
-		case strings.Contains(line, "CONNECT"):
-			fmt.Println("Connection established")
-
-			cmd := exec.Command(config.Program.Command, config.Program.Args...)
-			stdin, err := cmd.StdinPipe()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to create stdin pipe: %v\n", err)
-				continue
-			}
-
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to create stdout pipe: %v\n", err)
-				continue
-			}
-
-			if err := cmd.Start(); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to start subprocess: %v\n", err)
-				continue
-			}
-
-			go func() {
-				io.Copy(port, stdout)
-			}()
-
-			go func() {
-				io.Copy(stdin, port)
-			}()
-
-			done := make(chan bool)
-			go func() {
-				cmd.Wait()
-				done <- true
-			}()
-
-			go func() {
-				for {
-					line, err := reader.ReadString('\n')
-					if err != nil {
-						return
-					}
-					if strings.Contains(strings.TrimSpace(line), "NO CARRIER") {
-						cmd.Process.Kill()
-						done <- true
-						return
-					}
-				}
-			}()
-
-			<-done
+		switch strings.TrimSpace(line) {
+		case "ATH0":
 			port.Write([]byte("ATH0\r"))
 			time.Sleep(500 * time.Millisecond)
 
-		case strings.Contains(line, "NO CARRIER"):
+		case "NO CARRIER":
 			fmt.Println("Connection terminated")
+
+		default:
+			if strings.Contains(strings.TrimSpace(line), "RING") {
+				handleRing(&port, reader, config.Program.Command, config.Program.Args)
+			}
 		}
 	}
 }
-
 func writeDefaultConfig(path string) error {
 	defaultPort := "/dev/ttyUSB0"
 	if runtime.GOOS == "windows" {
