@@ -1,0 +1,26 @@
+[serial]
+  port = "/dev/tty.usbmodem2101"
+  baud_rate = 9600
+  data_bits = 8
+  parity = "N"
+  stop_bits = 1
+
+[modem]
+   init_commands = [
+    # Hang up and reset the modem
+    "ATH0", "AT&F0",
+    # Give us short responses, don't echo back to us.
+    # ATX0 -> just send us "CONNECT", not a rate or other information 
+    "ATV0", "ATX0", "ATE",
+    # Don't automatically pick up calls
+    "ATS0=0",
+    # Wait 10 seconds if we have to blind dial
+    "ATS6=10"
+
+    # We clean up our own messes. 
+    "AT&D0", ]
+#  init_commands = ["ATZ0, "ATV1", "ATE0", "ATH0", "ATS0=0"]
+
+[program]
+  command = "fortune"
+  args = []
